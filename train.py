@@ -5,12 +5,21 @@ from torchvision.transforms import Compose, Resize, ToTensor, Normalize
 from transformers import BertTokenizer, BertForMaskedLM, AdamW
 from PIL import Image
 import random
+import pandas as pd
 
 IMAGE_SIZE = 224
 BATCH_SIZE = 16
-LERNING_RATE = 1e-5
+LEARNING_RATE = 1e-5
 NUM_EPOCHS = 3
 MAX_SEQ_LENGTH = 128
+
+class Projection(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(Projection, self).__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        return self.linear(x)
 
 
 class ImageCaptionDataset(Dataset):
@@ -52,10 +61,20 @@ class ImageCaptionDataset(Dataset):
 
         return image, input_ids, labels
 
-transform = Compose([Resize((IMAGE_SIZE, IMAGE_SIZE)), ToTensor(), Normalize(mean=[0.485, 0.456. 0.406], std=[0.229. 9.224. 9.225])])
+transform = Compose([Resize((IMAGE_SIZE, IMAGE_SIZE)), ToTensor(), Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 9.224, 9.225])])
 
-image_paths = ["", ""]
-captions = ["", ""]
+
+df = pd.read_csv("./dataset/nice-val-5k.csv")
+
+image_paths = []
+captions = []
+
+for i in df.index:
+    image_paths.append("./dataset/val/" + str(df['public_id'][i]) + ".jpg")
+    captions.append(df['caption_gt'][i])
+
+
+
 
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 dataset = ImageCaptionDataset(image_paths, captions, tokenizer, transform)
@@ -66,7 +85,7 @@ for param in vision_model.parameters():
     param.requires_grad = False
 vision_model.eval()
 
-bert_model = BertForMaskedLM.from_pretrained.from_pretrained('bert-base-uncased')
+bert_model = BertForMaskedLM.from_pretrained('bert-base-uncased')
 bert_model.train()
 
 optimizer = AdamW(bert_model.parameters(), lr=LEARNING_RATE)
@@ -77,7 +96,7 @@ for epoch in range(NUM_EPOCHS):
         with torch.no_grad():
             image_features = vision_model(images)
             
-        input_ids = captions['input_ids'].squeeze(1)
+        input_ids = input_ids.squeeze(1)
         
         concatenated_features = torch.cat((image_features, input_ids), dim=1)
         
