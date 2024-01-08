@@ -1,119 +1,87 @@
+import requests
+from PIL import Image
+from transformers import BlipProcessor, BlipForConditionalGeneration
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision.models import resnet50
-from torchvision.transforms import Compose, Resize, ToTensor, Normalize
-from transformers import BertTokenizer, BertForMaskedLM, AdamW
-from PIL import Image
-import random
+from torchvision import transforms
+import os
 import pandas as pd
 
-IMAGE_SIZE = 224
-BATCH_SIZE = 16
-LEARNING_RATE = 1e-5
-NUM_EPOCHS = 3
-MAX_SEQ_LENGTH = 128
+torch.cuda.empty_cache()
 
-class Projection(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super(Projection, self).__init__()
-        self.linear = nn.Linear(input_dim, output_dim)
-
-    def forward(self, x):
-        return self.linear(x)
-
-
-class ImageCaptionDataset(Dataset):
-    def __init__(self, image_paths, captions, tokenizer, transform=None):
-        self.image_paths = image_paths
-        self.captions = captions
-        self.tokenizer = tokenizer
+class ImageTextDataset(Dataset):
+    def __init__(self, img_dir, text_file, transform=None):
+        self.img_dir = img_dir
         self.transform = transform
-    
+        
+        self.captions_df = pd.read_csv(text_file)
+        
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.captions_df)
     
     def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert("RGB")
+        img_filename = str(self.captions_df.iloc[idx]['public_id']) + ".jpg"
+        img_path = os.path.join(self.img_dir, img_filename)
+        image = Image.open(img_path).convert("RGB")
+        caption = str(self.captions_df.iloc[idx]['caption_gt'])
+        
         if self.transform:
             image = self.transform(image)
-        caption = self.captions[idx]
-        encoded_caption = self.tokenizer.encode_plus(
-            caption,
-            add_special_tokens=True,
-            max_length=MAX_SEQ_LENGTH,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
         
-        # Masking tokens randomly
-        input_ids = encoded_caption['input_ids'].squeeze()
-        labels = input_ids.clone()
-        rand = torch.rand(input_ids.shape)
-        mask_arr = (rand < 0.15) * (input_ids != 101) * (input_ids != 102) * (input_ids != 0)
-        selection = []
+        return image, caption
+    
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),  
+    transforms.ToTensor(),             
+])
 
-        for i in range(input_ids.shape[0]):
-            if mask_arr[i]:
-                selection.append(i)
+img_dir = '/notebooks/zeroshot_caption/dataset/val'
+text_file = '/notebooks/zeroshot_caption/dataset/nice-val-5k.csv'
+batch_size = 8
 
-        input_ids[selection] = 103
+# Create Dataset
+dataset = ImageTextDataset(img_dir=img_dir, text_file=text_file, transform=transform)
 
-        return image, input_ids, labels
-
-transform = Compose([Resize((IMAGE_SIZE, IMAGE_SIZE)), ToTensor(), Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 9.224, 9.225])])
-
-
-df = pd.read_csv("./dataset/nice-val-5k.csv")
-
-image_paths = []
-captions = []
-
-for i in df.index:
-    image_paths.append("./dataset/val/" + str(df['public_id'][i]) + ".jpg")
-    captions.append(df['caption_gt'][i])
+# Create DataLoader
+data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
 
+processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large").to("cuda")
 
+from transformers import AdamW
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-dataset = ImageCaptionDataset(image_paths, captions, tokenizer, transform)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+# Prepare optimizer
+optimizer = AdamW(model.parameters(), lr=5e-5)
 
-vision_model = resnet50(pretrained=True)
-for param in vision_model.parameters():
-    param.requires_grad = False
-vision_model.eval()
+# Number of training epochs
+num_epochs = 1
 
-bert_model = BertForMaskedLM.from_pretrained('bert-base-uncased')
-bert_model.train()
+# Training loop
+for epoch in range(num_epochs):
+    model.train()
+    for batch in data_loader:
+        images = batch[0]
+        captions = batch[1]
 
-optimizer = AdamW(bert_model.parameters(), lr=LEARNING_RATE)
+        # Preprocess images and captions
+        inputs = [processor(image, text, return_tensors="pt", padding="max_length").to("cuda", torch.float16) for image, text in zip(images, captions)]
 
-for epoch in range(NUM_EPOCHS):
-    for images, input_ids, labels in dataloader:
-        
-        with torch.no_grad():
-            image_features = vision_model(images)
-            
-        input_ids = input_ids.squeeze(1)
-        
-        concatenated_features = torch.cat((image_features, input_ids), dim=1)
-        
-        outputs = bert_model(input_ids=concatenated_features, labels=labels)
+        # Concatenate batch data
+        input_ids = torch.cat([input["input_ids"] for input in inputs], dim=0)
+        attention_mask = torch.cat([input["attention_mask"] for input in inputs], dim=0)
+        pixel_values = torch.cat([input["pixel_values"] for input in inputs], dim=0)
+
+        # Forward pass
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, pixel_values=pixel_values, labels=input_ids)
         loss = outputs.loss
-        
+
+        # Backward pass
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
-        print(f"Epoch [{epoch+1}/{NUM_EPOCHS}], Loss: {loss.item()}")
 
+        print(f"Epoch: {epoch}, Loss: {loss.item()}")
 
-# model_save_path = "./models/bert_image_captioning_model.pth"
-# torch.save(bert_model.state_dict(), model_save_path)
-
-# Load the model
-# bert_model = BertForSequenceClassification.from_pretrained('bert-base-uncased')
-# bert_model.load_state_dict(torch.load(model_save_path))
-# bert_model.eval()
+    # Save the model after each epoch
+    model.save_pretrained(f"blip_finetuned_epoch_{epoch}")
